@@ -31,11 +31,16 @@ QUESTIONS = [
 MOSCOW_TZ = pytz.timezone('Europe/Moscow')
 
 # Время отправки опроса (19:00 по Москве)
-SURVEY_TIME = time(19, 00)
+SURVEY_TIME = time(19, 0)
 
 # FSM состояния
 class SurveyStates(StatesGroup):
     waiting_for_answer = State()
+
+class RegistrationStates(StatesGroup):
+    waiting_for_pet_type = State()
+    waiting_for_pet_name = State()
+    waiting_for_pet_age = State()
 
 # Инициализация бота
 bot = Bot(token=BOT_TOKEN)
@@ -69,6 +74,7 @@ async def cmd_start(message: types.Message):
         user_data[user_id] = {
             "username": message.from_user.username,
             "first_name": message.from_user.first_name,
+            "pet_info": None,
             "surveys": []
         }
         save_user_data(user_data)
@@ -80,13 +86,43 @@ async def cmd_start(message: types.Message):
         "/start - Начать работу с ботом\n"
         "/survey - Пройти опрос сейчас\n"
         "/history - Посмотреть историю ответов\n"
+        "/pet - Посмотреть информацию о питомце\n"
+        "/editpet - Изменить информацию о питомце\n"
         "/stop - Отписаться от ежедневных опросов"
     )
 
 @dp.message(Command("survey"))
 async def cmd_survey(message: types.Message, state: FSMContext):
     """Начать опрос вручную"""
-    await start_survey(message.from_user.id, state)
+    user_id = str(message.from_user.id)
+    
+    # Проверяем, зарегистрирован ли питомец
+    if user_id not in user_data or user_data[user_id].get("pet_info") is None:
+        await start_registration(message.from_user.id, state)
+    else:
+        await start_survey(message.from_user.id, state)
+
+@dp.message(Command("pet"))
+async def cmd_pet(message: types.Message):
+    """Показать информацию о питомце"""
+    user_id = str(message.from_user.id)
+    
+    if user_id not in user_data or user_data[user_id].get("pet_info") is None:
+        await message.answer("У тебя ещё не зарегистрирован питомец. Используй /survey для начала.")
+        return
+    
+    pet = user_data[user_id]["pet_info"]
+    await message.answer(
+        f"🐾 Твой питомец:\n\n"
+        f"Вид: {pet['type']}\n"
+        f"Имя: {pet['name']}\n"
+        f"Возраст: {pet['age']}"
+    )
+
+@dp.message(Command("editpet"))
+async def cmd_editpet(message: types.Message, state: FSMContext):
+    """Изменить информацию о питомце"""
+    await start_registration(message.from_user.id, state)
 
 @dp.message(Command("history"))
 async def cmd_history(message: types.Message):
@@ -119,6 +155,62 @@ async def cmd_stop(message: types.Message):
         await message.answer("Ты отписался от ежедневных опросов. Используй /start, чтобы снова подписаться.")
     else:
         await message.answer("Ты и так не подписан на опросы.")
+
+async def start_registration(user_id: int, state: FSMContext):
+    """Начать регистрацию питомца"""
+    await state.set_state(RegistrationStates.waiting_for_pet_type)
+    await bot.send_message(
+        user_id,
+        "🐾 Давай познакомимся с твоим питомцем!\n\n"
+        "Вопрос 1 из 3:\nКакой у тебя питомец? (например: кошка, собака, хомяк, попугай)"
+    )
+
+@dp.message(RegistrationStates.waiting_for_pet_type)
+async def process_pet_type(message: types.Message, state: FSMContext):
+    """Обработка типа питомца"""
+    await state.update_data(pet_type=message.text)
+    await state.set_state(RegistrationStates.waiting_for_pet_name)
+    await message.answer("Вопрос 2 из 3:\nКак зовут твоего питомца?")
+
+@dp.message(RegistrationStates.waiting_for_pet_name)
+async def process_pet_name(message: types.Message, state: FSMContext):
+    """Обработка имени питомца"""
+    await state.update_data(pet_name=message.text)
+    await state.set_state(RegistrationStates.waiting_for_pet_age)
+    await message.answer("Вопрос 3 из 3:\nСколько лет твоему питомцу? (можно примерно)")
+
+@dp.message(RegistrationStates.waiting_for_pet_age)
+async def process_pet_age(message: types.Message, state: FSMContext):
+    """Обработка возраста питомца и завершение регистрации"""
+    data = await state.get_data()
+    user_id = str(message.from_user.id)
+    
+    # Сохраняем информацию о питомце
+    if user_id not in user_data:
+        user_data[user_id] = {
+            "username": message.from_user.username,
+            "first_name": message.from_user.first_name,
+            "surveys": []
+        }
+    
+    user_data[user_id]["pet_info"] = {
+        "type": data['pet_type'],
+        "name": data['pet_name'],
+        "age": message.text
+    }
+    save_user_data(user_data)
+    
+    await message.answer(
+        f"✅ Отлично! Информация сохранена:\n\n"
+        f"🐾 {data['pet_type']}\n"
+        f"📝 Имя: {data['pet_name']}\n"
+        f"🎂 Возраст: {message.text}\n\n"
+        f"Теперь начнём ежедневный опрос!"
+    )
+    
+    # Переходим к опросу
+    await state.clear()
+    await start_survey(int(user_id), state)
 
 async def start_survey(user_id: int, state: FSMContext):
     """Начать опрос для пользователя"""
@@ -189,8 +281,15 @@ async def send_daily_survey():
     
     for user_id in list(user_data.keys()):
         try:
-            state = dp.fsm.get_context(bot, user_id=int(user_id), chat_id=int(user_id))
-            await start_survey(int(user_id), state)
+            # Проверяем, есть ли информация о питомце
+            if user_data[user_id].get("pet_info") is None:
+                # Если питомец не зарегистрирован, начинаем регистрацию
+                state = dp.fsm.get_context(bot, user_id=int(user_id), chat_id=int(user_id))
+                await start_registration(int(user_id), state)
+            else:
+                # Если питомец зарегистрирован, отправляем опрос
+                state = dp.fsm.get_context(bot, user_id=int(user_id), chat_id=int(user_id))
+                await start_survey(int(user_id), state)
             await asyncio.sleep(1)  # Задержка между отправками
         except Exception as e:
             logger.error(f"Ошибка при отправке опроса пользователю {user_id}: {e}")
